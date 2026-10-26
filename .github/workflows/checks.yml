@@ -1,0 +1,17 @@
+name: checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install validation tools
+        run: sudo apt-get update && sudo apt-get install -y shellcheck ripgrep
+      - name: ShellCheck and mocked integration tests
+        run: bash tests/check.sh
+      - name: Validate systemd units
+        run: |
+          sudo install -m 755 bin/wireguard-uptime-monitor /usr/local/bin/wireguard-uptime-monitor
+          systemd-analyze verify systemd/wireguard-uptime-monitor.service systemd/wireguard-uptime-monitor.timer

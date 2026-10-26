@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Resolve installed symlink without depending on GNU readlink -f.
+SELF=${BASH_SOURCE[0]}
+while [[ -L $SELF ]]; do
+    BASE=$(cd -P "$(dirname "$SELF")" && pwd)
+    SELF=$(readlink "$SELF")
+    [[ $SELF == /* ]] || SELF=$BASE/$SELF
+done
+BASE=$(cd -P "$(dirname "$SELF")/.." && pwd)
+# shellcheck source=lib/common.sh
+source "$BASE/lib/common.sh"
+usage() {
+    cat <<'HELP'
+wireguard-uptime-monitor 0.1.0
+  install [--migrate-legacy] | update --source CHECKOUT | uninstall
+  add --server CA01 --ip 10.0.0.2 --push-url-file FILE [--enabled yes|no]
+      [--tcp HOST:PORT] [--threshold SECONDS] [--client LABEL] [--location LABEL]
+  remove NAME | list | status | discover | test NAME | run
+The URL file contains one Uptime Kuma Push URL. Use '-' to read stdin.
+add defaults to disabled. To change a peer: remove it, then add it again.
+HELP
+}
+cmd=${1:-help}; [[ $# == 0 ]] || shift
+case $cmd in
+    help|--help|-h) usage; exit 0;;
+    --version) printf '%s\n' "$VERSION"; exit 0;;
+    install|uninstall) exec "$BASE/install.sh" "$cmd" "$@";;
+    update)
+        [[ $# == 2 && $1 == --source ]] || fail 'Usage: update --source CHECKOUT'
+        exec "$2/install.sh" update;;
+esac
+require_root
+init_dirs
+lock_all
+case $cmd in
+    add)
+        server='' ip='' urlfile='' tcp='' threshold=600 enabled=no client='' location=''
+        while (( $# )); do
+            [[ $# -ge 2 ]] || fail 'Missing option value.'
+            case $1 in
+                --server) server=$2;; --ip) ip=$2;; --push-url-file) urlfile=$2;;
+                --tcp) tcp=$2;; --threshold) threshold=$2;; --enabled) enabled=$2;;
+                --client) client=$2;; --location) location=$2;; *) fail 'Unknown add option.';;
+            esac
+            shift 2
+        done
+        if [[ ! $server =~ ^[A-Z0-9][A-Z0-9-]*$ ]] || ! valid_ip "$ip"; then fail 'Use an uppercase server identifier and an IPv4 tunnel address.'; fi
+        [[ -n $urlfile ]] || fail '--push-url-file is required.'
+        if [[ $urlfile == - ]]; then IFS= read -r url || [[ -n ${url:-} ]]; else url=$(cat -- "$urlfile"); fi
+        for value in "$client" "$location" "$tcp" "$url" "$threshold" "$enabled"; do
+            [[ $value != *$'\n'* && $value != *$'\r'* ]] || fail 'Values must be single lines.'
+        done
+        printf -v name 'VPN-%s-%03d' "$server" "${ip##*.}"
+        tmp=$(mktemp "$CONFIG/.peer.XXXXXX")
+        trap 'rm -f -- "$tmp"' EXIT
+        printf 'NAME=%s\nIP=%s\nTCP=%s\nPUSH_URL=%s\nTHRESHOLD=%s\nENABLED=%s\nCLIENT=%s\nLOCATION=%s\n' \
+            "$name" "$ip" "$tcp" "$url" "$threshold" "$enabled" "$client" "$location" > "$tmp"
+        load_peer "$tmp" || fail 'Invalid peer configuration (URL must be a bare /api/push/TOKEN URL).'
+        if [[ -e $CONFIG/$name.conf ]]; then
+            cmp -s "$tmp" "$CONFIG/$name.conf" || fail 'Peer already exists; remove it before changing configuration.'
+        else mv "$tmp" "$CONFIG/$name.conf"; fi
+        printf '%s configured (enabled=%s).\n' "$name" "$ENABLED"
+        ;;
+    remove)
+        if [[ $# != 1 ]] || ! valid_name "$1"; then fail 'Usage: remove NAME'; fi
+        rm -f -- "$CONFIG/$1.conf" "$STATE/$1.state"
+        ;;
+    discover)
+        # Read dump through a pipe; never persist private keys or preshared keys.
+        wg show all dump | awk -F '\t' 'NF == 9 { n=split($5,ips,","); for(i=1;i<=n;i++) if(ips[i] ~ /\/32$/) { sub(/\/32$/,"",ips[i]); printf "interface=%s public_key=%s tunnel_ip=%s (disabled; use add)\n",$1,$2,ips[i] } }'
+        ;;
+    list|status)
+        shopt -s nullglob
+        for file in "$CONFIG"/*.conf; do
+            load_peer "$file" || { printf 'Invalid peer file (details redacted).\n' >&2; continue; }
+            current=unknown since=0
+            if [[ -f $STATE/$NAME.state ]]; then IFS=$'\t' read -r since current < "$STATE/$NAME.state" || true; fi
+            printf '%s ip=%s enabled=%s threshold=%ss state=%s since=%s\n' "$NAME" "$IP" "$ENABLED" "$THRESHOLD" "$current" "$since"
+        done
+        ;;
+    test)
+        if [[ $# != 1 ]] || ! valid_name "$1"; then fail 'Usage: test NAME'; fi
+        load_peer "$CONFIG/$1.conf" || fail 'Invalid or missing peer configuration.'
+        if health; then printf '%s healthy (no push or state change).\n' "$NAME"; else printf '%s failed (no push or state change).\n' "$NAME"; exit 1; fi
+        ;;
+    run)
+        shopt -s nullglob
+        result=0
+        for file in "$CONFIG"/*.conf; do
+            if ! load_peer "$file"; then printf 'Invalid peer file (details redacted).\n' >&2; result=1; continue; fi
+            [[ $ENABLED == yes ]] || continue
+            now=$(date +%s); since=0
+            if [[ -f $STATE/$NAME.state ]]; then IFS=$'\t' read -r since _ < "$STATE/$NAME.state" || true; fi
+            [[ $since =~ ^(0|[1-9][0-9]{0,11})$ ]] || { printf '%s: invalid state; repair required.\n' "$NAME" >&2; result=1; continue; }
+            if health; then
+                write_state 0 up
+                if ! push up 'Tunnel reachable'; then printf '%s: push failed (URL redacted).\n' "$NAME" >&2; result=1; fi
+                printf '%s up\n' "$NAME"
+            else
+                if (( since == 0 || since > now )); then since=$now; fi
+                if (( now - since >= THRESHOLD )); then
+                    write_state "$since" down
+                    if ! push down 'Tunnel unreachable beyond threshold'; then printf '%s: push failed (URL redacted).\n' "$NAME" >&2; result=1; fi
+                    printf '%s down\n' "$NAME"
+                else write_state "$since" pending; printf '%s pending (no heartbeat sent)\n' "$NAME"; fi
+            fi
+        done
+        exit "$result"
+        ;;
+    *) fail 'Unknown command; use --help.';;
+esac

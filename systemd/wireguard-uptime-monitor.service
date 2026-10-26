@@ -1,0 +1,16 @@
+[Unit]
+Description=WireGuard peer reachability monitor
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=0
+ExecStart=/usr/local/bin/wireguard-uptime-monitor run
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/etc/wireguard-uptime-monitor /var/lib/wireguard-uptime-monitor /run/lock
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK

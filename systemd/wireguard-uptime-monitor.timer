@@ -1,0 +1,11 @@
+[Unit]
+Description=Check enabled WireGuard peers every 60 seconds
+
+[Timer]
+OnCalendar=*-*-* *:*:00
+Persistent=true
+AccuracySec=1s
+Unit=wireguard-uptime-monitor.service
+
+[Install]
+WantedBy=timers.target
