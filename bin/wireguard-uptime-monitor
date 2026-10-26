@@ -12,13 +12,23 @@ BASE=$(cd -P "$(dirname "$SELF")/.." && pwd)
 source "$BASE/lib/common.sh"
 usage() {
     cat <<'HELP'
-wireguard-uptime-monitor 0.1.0
-  install [--migrate-legacy] | update --source CHECKOUT | uninstall
+wireguard-uptime-monitor 0.2.0
+  install | update --source CHECKOUT | uninstall
   add --server CA01 --ip 10.0.0.2 --push-url-file FILE [--enabled yes|no]
       [--tcp HOST:PORT] [--threshold SECONDS] [--client LABEL] [--location LABEL]
+  bulk-add --file peers.csv [--dry-run]
+  enable NAME | disable NAME
+  set NAME [--threshold SECONDS] [--push-url-file FILE]
+  enable-all|disable-all [--yes] [--dry-run]
   remove NAME | list | status | discover | test NAME | run
-The URL file contains one Uptime Kuma Push URL. Use '-' to read stdin.
-add defaults to disabled. To change a peer: remove it, then add it again.
+URL files contain a bare Kuma Push URL; '-' reads stdin. add defaults:
+threshold=300 seconds, enabled=no. The timer runs every 60 seconds.
+CSV header: name,ip,threshold,push_url,enabled (optional columns except name).
+New rows require IP and Push URL. Empty fields preserve existing values;
+new peers default to threshold=300 and enabled=no. Duplicate CSV names fail.
+Bulk changes validate every row before writing. --dry-run changes no peer configuration or state.
+enable-all/disable-all require --yes or an interactive confirmation.
+Changes retain failure history; tokens change only when a URL is supplied.
 HELP
 }
 cmd=${1:-help}; [[ $# == 0 ]] || shift
@@ -31,11 +41,31 @@ case $cmd in
         exec "$2/install.sh" update;;
 esac
 require_root
-init_dirs
-lock_all
+# Atomic file replacement makes read-only commands safe without the run lock.
+case $cmd in
+    list|status|test|discover) ;;
+    *) init_dirs; lock_all;;
+esac
+read_url() {
+    if [[ $1 == - ]]; then IFS= read -r PUSH_URL || [[ -n ${PUSH_URL:-} ]]; else PUSH_URL=$(cat -- "$1"); fi
+    valid_url "$PUSH_URL" || fail 'Invalid Push URL (details redacted).'
+}
+stage_begin() {
+    stage=$(mktemp -d "$CONFIG/.batch.XXXXXX")
+    trap 'rm -rf -- "$stage"' EXIT
+}
+stage_commit() {
+    local staged count=0
+    shopt -s nullglob
+    for staged in "$stage"/*.conf; do
+        if [[ $dry_run == no ]]; then mv -f -- "$staged" "$CONFIG/${staged##*/}"; fi
+        count=$((count + 1))
+    done
+    printf '%s peer(s) validated (dry-run=%s).\n' "$count" "$dry_run"
+}
 case $cmd in
     add)
-        server='' ip='' urlfile='' tcp='' threshold=600 enabled=no client='' location=''
+        server='' ip='' urlfile='' tcp='' threshold=300 enabled=no client='' location=''
         while (( $# )); do
             [[ $# -ge 2 ]] || fail 'Missing option value.'
             case $1 in
@@ -58,9 +88,103 @@ case $cmd in
             "$name" "$ip" "$tcp" "$url" "$threshold" "$enabled" "$client" "$location" > "$tmp"
         load_peer "$tmp" || fail 'Invalid peer configuration (URL must be a bare /api/push/TOKEN URL).'
         if [[ -e $CONFIG/$name.conf ]]; then
-            cmp -s "$tmp" "$CONFIG/$name.conf" || fail 'Peer already exists; remove it before changing configuration.'
+            cmp -s "$tmp" "$CONFIG/$name.conf" || fail 'Peer already exists; use set, enable, disable or bulk-add to preserve history.'
         else mv "$tmp" "$CONFIG/$name.conf"; fi
         printf '%s configured (enabled=%s).\n' "$name" "$ENABLED"
+        ;;
+    enable|disable|set)
+        if [[ $# -lt 1 ]] || ! valid_name "$1"; then fail 'A valid peer NAME is required.'; fi
+        target="$CONFIG/$1.conf"
+        load_peer "$target" && [[ $NAME == "$1" ]] || fail 'Invalid or missing peer configuration.'
+        shift
+        case $cmd in
+            enable) ENABLED=yes;; disable) ENABLED=no;;
+            set)
+                [[ $# -gt 0 ]] || fail 'Usage: set NAME --threshold SECONDS [--push-url-file FILE]'
+                while (( $# )); do
+                    [[ $# -ge 2 ]] || fail 'Missing option value.'
+                    case $1 in
+                        --threshold) THRESHOLD=$2;;
+                        --push-url-file) read_url "$2";;
+                        *) fail 'Unknown set option.';;
+                    esac
+                    shift 2
+                done;;
+        esac
+        [[ $# == 0 ]] || fail 'Unexpected arguments.'
+        save_peer "$target" || fail 'Invalid peer change; original retained.'
+        printf '%s configured (enabled=%s threshold=%s).\n' "$NAME" "$ENABLED" "$THRESHOLD"
+        ;;
+    bulk-add)
+        csv='' dry_run=no
+        while (( $# )); do
+            case $1 in
+                --file) [[ $# -ge 2 ]] || fail 'Missing CSV file.'; csv=$2; shift 2;;
+                --dry-run) dry_run=yes; shift;;
+                *) fail 'Usage: bulk-add --file peers.csv [--dry-run]';;
+            esac
+        done
+        [[ -f $csv ]] || fail 'A CSV file is required.'
+        # Only unquoted records are accepted: none of the supported values need commas.
+        exec 7< "$csv"
+        IFS= read -r header <&7 || [[ -n ${header:-} ]] || fail 'Missing CSV header.'
+        header=${header%$'\r'}
+        IFS=, read -r -a columns <<< "$header,_"
+        unset 'columns[${#columns[@]}-1]'
+        declare -A headers=() names=()
+        for column in "${columns[@]}"; do
+            case $column in name|ip|threshold|push_url|enabled) ;; *) fail 'Invalid CSV header.';; esac
+            [[ ! ${headers[$column]+yes} ]] || fail 'Duplicate CSV column.'
+            headers[$column]=1
+        done
+        [[ ${headers[name]:-} == 1 ]] || fail 'CSV requires a name column.'
+        stage_begin
+        line_number=1
+        while IFS= read -r line <&7 || [[ -n $line ]]; do
+            line_number=$((line_number + 1)); line=${line%$'\r'}
+            [[ -n $line ]] || continue
+            [[ $line != *\"* ]] || fail "Quoted CSV is unsupported (row $line_number)."
+            IFS=, read -r -a fields <<< "$line,_"
+            unset 'fields[${#fields[@]}-1]'
+            [[ ${#fields[@]} == "${#columns[@]}" ]] || fail "Wrong CSV field count (row $line_number)."
+            declare -A row=()
+            for index in "${!columns[@]}"; do row[${columns[$index]}]=${fields[$index]}; done
+            name=${row[name]}
+            valid_name "$name" || fail "Invalid name (row $line_number)."
+            [[ ! ${names[$name]+yes} ]] || fail "Duplicate name (row $line_number)."
+            names[$name]=1
+            if [[ -e $CONFIG/$name.conf || -L $CONFIG/$name.conf ]]; then
+                load_peer "$CONFIG/$name.conf" && [[ $NAME == "$name" ]] || fail "Invalid existing peer (row $line_number)."
+            else
+                NAME=$name IP='' TCP='' PUSH_URL='' CLIENT='' LOCATION='' ENABLED=no THRESHOLD=300
+            fi
+            IP=${row[ip]:-$IP}; THRESHOLD=${row[threshold]:-$THRESHOLD}
+            PUSH_URL=${row[push_url]:-$PUSH_URL}; ENABLED=${row[enabled]:-$ENABLED}
+            save_peer "$stage/$name.conf" || fail "Invalid peer (row $line_number); no peers changed."
+        done
+        exec 7<&-
+        stage_commit
+        ;;
+    enable-all|disable-all)
+        confirmed=no dry_run=no
+        while (( $# )); do
+            case $1 in --yes) confirmed=yes;; --dry-run) dry_run=yes;; *) fail 'Use --yes and/or --dry-run.';; esac
+            shift
+        done
+        stage_begin
+        shopt -s nullglob
+        for file in "$CONFIG"/*.conf; do
+            load_peer "$file" || fail 'Invalid peer file; no peers changed.'
+            [[ $cmd == enable-all ]] && ENABLED=yes || ENABLED=no
+            save_peer "$stage/${file##*/}" || fail 'Invalid peer; no peers changed.'
+        done
+        if [[ $dry_run == no && $confirmed != yes ]]; then
+            [[ -t 0 ]] || fail 'Bulk enablement requires --yes (or an interactive terminal).'
+            printf 'Apply %s to every peer? Type yes: ' "$cmd"
+            IFS= read -r answer
+            [[ $answer == yes ]] || fail 'Cancelled; no peers changed.'
+        fi
+        stage_commit
         ;;
     remove)
         if [[ $# != 1 ]] || ! valid_name "$1"; then fail 'Usage: remove NAME'; fi
@@ -74,9 +198,9 @@ case $cmd in
         shopt -s nullglob
         for file in "$CONFIG"/*.conf; do
             load_peer "$file" || { printf 'Invalid peer file (details redacted).\n' >&2; continue; }
-            current=unknown since=0
-            if [[ -f $STATE/$NAME.state ]]; then IFS=$'\t' read -r since current < "$STATE/$NAME.state" || true; fi
-            printf '%s ip=%s enabled=%s threshold=%ss state=%s since=%s\n' "$NAME" "$IP" "$ENABLED" "$THRESHOLD" "$current" "$since"
+            if ! read_state; then printf '%s: invalid state; repair required.\n' "$NAME" >&2; continue; fi
+            printf '%s ip=%s enabled=%s threshold=%ss state=%s since=%s reported=%s delivery=%s\n' \
+                "$NAME" "$IP" "$ENABLED" "$THRESHOLD" "$current" "$since" "$reported" "$delivery"
         done
         ;;
     test)
@@ -85,27 +209,21 @@ case $cmd in
         if health; then printf '%s healthy (no push or state change).\n' "$NAME"; else printf '%s failed (no push or state change).\n' "$NAME"; exit 1; fi
         ;;
     run)
+        [[ $# == 0 ]] || fail 'Usage: run'
         shopt -s nullglob
         result=0
+        workers=()
+        # Eight workers maximum; each peer has a <=33s network/check budget.
+        # Wait for each bounded batch so every peer receives a turn.
         for file in "$CONFIG"/*.conf; do
-            if ! load_peer "$file"; then printf 'Invalid peer file (details redacted).\n' >&2; result=1; continue; fi
-            [[ $ENABLED == yes ]] || continue
-            now=$(date +%s); since=0
-            if [[ -f $STATE/$NAME.state ]]; then IFS=$'\t' read -r since _ < "$STATE/$NAME.state" || true; fi
-            [[ $since =~ ^(0|[1-9][0-9]{0,11})$ ]] || { printf '%s: invalid state; repair required.\n' "$NAME" >&2; result=1; continue; }
-            if health; then
-                write_state 0 up
-                if ! push up 'Tunnel reachable'; then printf '%s: push failed (URL redacted).\n' "$NAME" >&2; result=1; fi
-                printf '%s up\n' "$NAME"
-            else
-                if (( since == 0 || since > now )); then since=$now; fi
-                if (( now - since >= THRESHOLD )); then
-                    write_state "$since" down
-                    if ! push down 'Tunnel unreachable beyond threshold'; then printf '%s: push failed (URL redacted).\n' "$NAME" >&2; result=1; fi
-                    printf '%s down\n' "$NAME"
-                else write_state "$since" pending; printf '%s pending (no heartbeat sent)\n' "$NAME"; fi
+            check_peer "$file" &
+            workers+=("$!")
+            if (( ${#workers[@]} == 8 )); then
+                for worker in "${workers[@]}"; do wait "$worker" || result=1; done
+                workers=()
             fi
         done
+        for worker in "${workers[@]}"; do wait "$worker" || result=1; done
         exit "$result"
         ;;
     *) fail 'Unknown command; use --help.';;

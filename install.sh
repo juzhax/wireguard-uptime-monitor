@@ -5,10 +5,8 @@ BASE=$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$BASE/lib/common.sh"
 require_root
 mode=install
-if [[ ${1:-} != --migrate-legacy && $# != 0 ]]; then mode=$1; shift; fi
-migrate=no
-if [[ ${1:-} == --migrate-legacy ]]; then migrate=yes; shift; fi
-[[ $# == 0 ]] || fail 'Usage: install.sh [install|update|uninstall] [--migrate-legacy]'
+if (( $# )); then mode=$1; shift; fi
+[[ $# == 0 ]] || fail 'Usage: install.sh [install|update|uninstall]'
 [[ $mode == install || $mode == update || $mode == uninstall ]] || fail 'Unknown installer command.'
 [[ $(uname -s) == Linux || ${WUM_TESTING:-0} == 1 ]] || fail 'A systemd-based Linux distribution is required.'
 if [[ $mode != uninstall ]]; then
@@ -16,9 +14,6 @@ if [[ $mode != uninstall ]]; then
         command -v "$dependency" >/dev/null || fail "Missing dependency: $dependency (see README package commands)."
     done
     (( BASH_VERSINFO[0] >= 4 )) || fail 'Bash 4 or newer is required.'
-    if [[ -d $ROOT/opt/vpn-monitor && ! -d $STATE/legacy-backup && $migrate != yes ]]; then
-        fail 'Legacy /opt/vpn-monitor found. Review README migration steps, then rerun with --migrate-legacy to create a private snapshot. The old installation is never changed.'
-    fi
 fi
 init_dirs
 lock_all
@@ -32,13 +27,8 @@ if [[ $mode == uninstall ]]; then
     rm -f "$bindir/wireguard-uptime-monitor"
     rm -rf -- "$libdir"
     systemctl daemon-reload
-    printf 'Uninstalled. Private configuration, state, and legacy snapshots retained.\n'
+    printf 'Uninstalled. Private configuration and state retained.\n'
     exit 0
-fi
-if [[ $migrate == yes && -d $ROOT/opt/vpn-monitor && ! -e $STATE/legacy-backup ]]; then
-    cp -a "$ROOT/opt/vpn-monitor" "$STATE/legacy-backup"
-    chmod -R go-rwx "$STATE/legacy-backup"
-    printf 'Private legacy snapshot saved. Configure peers explicitly; legacy jobs remain unchanged.\n'
 fi
 mkdir -p "$unitdir" "$libdir/releases" "$bindir"
 # Fully stage a release before atomically switching the current link.

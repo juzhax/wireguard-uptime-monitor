@@ -1,0 +1,3 @@
+name,ip,threshold,push_url,enabled
+VPN-CA01-002,10.0.0.2,300,https://kuma.example.com/api/push/REPLACE_CA01,no
+VPN-SG03-050,10.0.0.50,,https://kuma.example.com/api/push/REPLACE_SG03,no
